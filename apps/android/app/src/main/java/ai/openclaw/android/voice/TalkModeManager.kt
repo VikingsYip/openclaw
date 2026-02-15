@@ -50,6 +50,21 @@ class TalkModeManager(
   private val supportsChatSubscribe: Boolean,
   private val isConnected: () -> Boolean,
 ) {
+  // iFlytek SDK for ASR and TTS (lazy init)
+  private var iflytekService: IFlytekSDKService? = null
+  private fun getIflytekService(): IFlytekSDKService? {
+    if (iflytekService == null) {
+      try {
+        iflytekService = IFlytekSDKService(context)
+      } catch (e: Exception) {
+        Log.e(tag, "Failed to create iFlytek service: ${e.message}")
+      }
+    }
+    return iflytekService
+  }
+
+  // Alias for TTS
+  private fun getIflytekTts(): IFlytekSDKService? = getIflytekService()
   companion object {
     private const val tag = "TalkMode"
     private const val defaultModelIdFallback = "eleven_v3"
@@ -154,17 +169,13 @@ class TalkModeManager(
   }
 
   private fun start() {
+    Log.d(tag, ">>> start() called")
     mainHandler.post {
+      Log.d(tag, ">>> start() post block")
       if (_isListening.value) return@post
       stopRequested = false
       listeningMode = true
       Log.d(tag, "start")
-
-      if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-        _statusText.value = "Speech recognizer unavailable"
-        Log.w(tag, "speech recognizer unavailable")
-        return@post
-      }
 
       val micOk =
         ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
@@ -175,12 +186,50 @@ class TalkModeManager(
         return@post
       }
 
+      // Use iFlytek ASR
+      val iflytek = getIflytekService()
+      if (iflytek == null) {
+        _statusText.value = "iFlytek not available"
+        Log.w(tag, "iFlytek service not available")
+        return@post
+      }
+
       try {
-        recognizer?.destroy()
-        recognizer = SpeechRecognizer.createSpeechRecognizer(context).also { it.setRecognitionListener(listener) }
-        startListeningInternal(markListening = true)
+        // Start iFlytek ASR
+        val started = iflytek.startASR()
+        if (!started) {
+          _statusText.value = "ASR start failed"
+          Log.w(tag, "iFlytek ASR start failed")
+          return@post
+        }
+
+        // Collect ASR results
+        _isListening.value = true
+        _statusText.value = "Listening..."
+
+        // Observe ASR results
+        Log.d(tag, "Registering ASR result observer...")
+        iflytek.getAsrResult().observeForever { result ->
+          Log.d(tag, ">>> ASR observer triggered: '$result', length=${result.length}")
+          if (result.isNotEmpty()) {
+            Log.d(tag, ">>> ASR result NOT empty, calling handleTranscript: $result")
+            handleTranscript(result, isFinal = true)
+          } else {
+            Log.d(tag, ">>> ASR result is empty, ignoring")
+          }
+        }
+
+        // Observe listening state - disabled because it conflicts with silence monitor
+        // We'll manage _isListening ourselves based on ASR results and silence detection
+        // iflytek.getIsListening().observeForever { isListening ->
+        //   if (!isListening && _isListening.value) {
+        //     _isListening.value = false
+        //     _statusText.value = "Processing..."
+        //   }
+        // }
+
         startSilenceMonitor()
-        Log.d(tag, "listening")
+        Log.d(tag, "iFlytek listening")
       } catch (err: Throwable) {
         _statusText.value = "Start failed: ${err.message ?: err::class.simpleName}"
         Log.w(tag, "start failed: ${err.message ?: err::class.simpleName}")
@@ -204,6 +253,8 @@ class TalkModeManager(
     chatSubscribedSessionKey = null
 
     mainHandler.post {
+      // Stop iFlytek ASR
+      getIflytekService()?.stopASR()
       recognizer?.cancel()
       recognizer?.destroy()
       recognizer = null
@@ -253,6 +304,7 @@ class TalkModeManager(
   }
 
   private fun handleTranscript(text: String, isFinal: Boolean) {
+    Log.d(tag, ">>> handleTranscript called: '$text', isFinal=$isFinal")
     val trimmed = text.trim()
     if (_isSpeaking.value && interruptOnSpeech) {
       if (shouldInterrupt(trimmed)) {
@@ -261,8 +313,14 @@ class TalkModeManager(
       return
     }
 
-    if (!_isListening.value) return
+    // Always process transcript if we have text, don't check _isListening.value
+    // because the isListening observer might have already set it to false
+    if (trimmed.isEmpty()) {
+      Log.d(tag, ">>> Empty transcript, ignoring")
+      return
+    }
 
+    Log.d(tag, ">>> Processing transcript: $trimmed")
     if (trimmed.isNotEmpty()) {
       lastTranscript = trimmed
       lastHeardAtMs = SystemClock.elapsedRealtime()
@@ -285,16 +343,26 @@ class TalkModeManager(
   }
 
   private fun checkSilence() {
-    if (!_isListening.value) return
+    Log.d(tag, ">>> checkSilence called, isListening=${_isListening.value}, lastTranscript=$lastTranscript")
+    if (!_isListening.value) {
+      Log.d(tag, ">>> checkSilence: not listening, returning")
+      return
+    }
     val transcript = lastTranscript.trim()
-    if (transcript.isEmpty()) return
+    if (transcript.isEmpty()) {
+      Log.d(tag, ">>> checkSilence: empty transcript, returning")
+      return
+    }
     val lastHeard = lastHeardAtMs ?: return
     val elapsed = SystemClock.elapsedRealtime() - lastHeard
+    Log.d(tag, ">>> checkSilence: elapsed=$elapsed, threshold=$silenceWindowMs")
     if (elapsed < silenceWindowMs) return
+    Log.d(tag, ">>> checkSilence: calling finalizeTranscript")
     scope.launch { finalizeTranscript(transcript) }
   }
 
   private suspend fun finalizeTranscript(transcript: String) {
+    Log.d(tag, ">>> finalizeTranscript called with: '$transcript'")
     listeningMode = false
     _isListening.value = false
     _statusText.value = "Thinking…"
@@ -303,12 +371,15 @@ class TalkModeManager(
 
     reloadConfig()
     val prompt = buildPrompt(transcript)
+    Log.d(tag, ">>> Prompt built, checking gateway connection...")
     if (!isConnected()) {
       _statusText.value = "Gateway not connected"
-      Log.w(tag, "finalize: gateway not connected")
+      Log.w(tag, ">>> finalize: gateway NOT connected!")
       start()
       return
     }
+
+    Log.d(tag, ">>> Gateway connected, sending to gateway...")
 
     try {
       val startedAt = System.currentTimeMillis().toDouble() / 1000.0
@@ -667,6 +738,26 @@ class TalkModeManager(
   private suspend fun speakWithSystemTts(text: String) {
     val trimmed = text.trim()
     if (trimmed.isEmpty()) return
+
+    // Use iFlytek TTS if available
+    val iflytek = getIflytekTts()
+    if (iflytek != null) {
+      Log.d(tag, "Using iFlytek TTS")
+      _isSpeaking.value = true
+      val started = iflytek.startTTS(trimmed)
+      if (!started) {
+        _isSpeaking.value = false
+        throw IllegalStateException("iFlytek TTS failed to start")
+      }
+      // Wait for iFlytek TTS to complete
+      while (iflytek.isSpeaking.value == true) {
+        delay(100)
+      }
+      _isSpeaking.value = false
+      return
+    }
+
+    // Fall back to system TTS
     val ok = ensureSystemTts()
     if (!ok) {
       throw IllegalStateException("system TTS unavailable")
@@ -760,18 +851,23 @@ class TalkModeManager(
     if (!_isSpeaking.value) {
       cleanupPlayer()
       cleanupPcmTrack()
+      // Stop iFlytek TTS if available
+      getIflytekTts()?.stopTTS()
       systemTts?.stop()
       systemTtsPending?.cancel()
       systemTtsPending = null
       systemTtsPendingId = null
       return
     }
+    // Stop iFlytek TTS if available
+    getIflytekService()?.stopTTS()
     if (resetInterrupt) {
       val currentMs = player?.currentPosition?.toDouble() ?: 0.0
       lastInterruptedAtSeconds = currentMs / 1000.0
     }
     cleanupPlayer()
     cleanupPcmTrack()
+    getIflytekService()?.stopTTS()
     systemTts?.stop()
     systemTtsPending?.cancel()
     systemTtsPending = null

@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Refresh
+import androidx.lifecycle.asFlow
 import androidx.compose.material.icons.filled.Report
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
@@ -86,6 +87,9 @@ fun RootScreen(viewModel: MainViewModel) {
   val talkStatusText by viewModel.talkStatusText.collectAsState()
   val talkIsListening by viewModel.talkIsListening.collectAsState()
   val talkIsSpeaking by viewModel.talkIsSpeaking.collectAsState()
+
+  // iFlytek debug log
+  val iflytekDebugLog by viewModel.iflytekService.getDebugLog().asFlow().collectAsState(initial = "")
   val seamColorArgb by viewModel.seamColorArgb.collectAsState()
   val seamColor = remember(seamColorArgb) { ComposeColor(seamColorArgb) }
   val audioPermissionLauncher =
@@ -271,6 +275,7 @@ fun RootScreen(viewModel: MainViewModel) {
         statusText = talkStatusText,
         isListening = talkIsListening,
         isSpeaking = talkIsSpeaking,
+        debugText = iflytekDebugLog,
       )
     }
   }
